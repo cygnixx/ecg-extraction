@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""
+fetal_ecg_extraction.py
+
+A compact, GitHub-friendly pipeline for noninvasive fetal ECG extraction
+based on PhysioNet/CinC Challenge 2013 tasks.
+
+Author: (You)
+Requirements: see requirements.txt
+
+References:
+- PhysioNet/Computing in Cardiology Challenge 2013 (data & annotations). :contentReference[oaicite:2]{index=2}
+"""
+
+import argparse
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import signal
+import wfdb
+from sklearn.decomposition import FastICA, PCA
+import pywt
+import pandas as pd
+from tqdm import tqdm
+
+# ----------------------------
+# Utility / signal processing
+# ----------------------------
+def butter_highpass(cutoff, fs, order=4):
+    nyq = 0.5 * fs
+    b, a = signal.butter(order, cutoff / nyq, btype='highpass')
+    return b, a
+
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    b, a = signal.butter(order, [lowcut/nyq, highcut/nyq], btype='bandpass')
+    return b, a
+
+def notch_filter(sig, fs, f0=50.0, Q=30.0):
+    # IIR notch
+    w0 = f0 / (fs / 2)
+    b, a = signal.iirnotch(w0, Q)
+    return signal.filtfilt(b, a, sig)
+
+def env_bandpass_qrs(sig, fs):
+    # Simple QRS bandpass (1-100 or 5-40) and envelope for peak detection
+    b, a = butter_bandpass(5, 40, fs, order=3)
+    filtered = signal.filtfilt(b, a, sig)
+    # envelope via absolute + lowpass
+    env = np.abs(filtered)
+    b_lp, a_lp = signal.butter(2, 8/(fs/2), btype='low')
+    envelope = signal.filtfilt(b_lp, a_lp, env)
+    return filtered, envelope
+
+# ----------------------------
+# Loading
+# ----------------------------
+def load_record(record_path, channels=None):
+    """
+    Load a wfdb record (without extension) or a CSV file.
+    If record_path points to a .csv, loads CSV; else treat as wfdb record name or file.
+    Returns: sig (n_channels x n_samples), fs, channel_names
+    """
+    if record_path.endswith('.csv') or os.path.exists(record_path + '.csv'):
+        csvp = record_path if record_path.endswith('.csv') else record_path + '.csv'
+        df = pd.read_csv(csvp)
+        sig = df.values.T
+        fs = 1000  # assumed for this dataset (PhysioNet 2013 uses 1000 Hz)
+        ch_names = list(df.columns)
+        return sig, fs, ch_names
+    else:
+        # wfdb record base name (path without extension)
+        rec = wfdb.rdrecord(record_path)
+        sig = rec.p_signal.T  # channels x samples
+        fs = rec.fs
+        ch_names = rec.sig_name
+        # optionally select channels
+        if channels is not None:
+            idx = [ch_names.index(c) if isinstance(c, str) and c in ch_names else c for c in channels]
+            sig = sig[idx]
+            ch_names = [ch_names[i] for i in idx]
+        return sig, fs, ch_names
+
+# ----------------------------
+# Maternal template subtraction
+# ----------------------------
+def detect_maternal_rpeaks(ecg, fs):
+    """
+    A simple maternal R-peak detector using bandpassed envelope + peak finding.
+    Returns sample indices of peaks.
+    """
+    _, envelope = env_bandpass_qrs(ecg, fs)
+    # dynamic threshold
+    thr = np.median(envelope) + 0.5 * (np.percentile(envelope, 90) - np.median(envelope))
+    distance = int(0.4 * fs)  # minimum maternal RR ~ 0.4s
+    peaks, _ = signal.find_peaks(envelope, height=thr, distance=distance)
+    return peaks
+
+def build_maternal_template(ecg_chest, peaks, fs, pre=0.2, post=0.4):
+    """
+    Build median maternal QRS template aligned to peaks.
+    pre/post in seconds.
+    """
+    pre_samps = int(pre * fs)
+    post_samps = int(post * fs)
+    snippets = []
+    n = len(ecg_chest)
+    for p in peaks:
+        a = max(0, p - pre_samps)
+        b = min(n, p + post_samps)
+        snip = ecg_chest[a:b]
+        # pad to same length
+        if len(snip) < pre_samps + post_samps:
+            snip = np.pad(snip, (0, pre_samps + post_samps - len(snip)), 'constant')
+        snippets.append(snip)
+    if not snippets:
+        return None
+    median_template = np.median(np.vstack(snippets), axis=0)
+    return median_template
+
+def subtract_template_from_abdomen(abdomen_sig, template, peaks, fs, pre=0.2, post=0.4):
+    """
+    Subtract scaled template at maternal peaks from abdominal channel(s).
+    abdomen_sig: shape (n_ch, n_samples) or (n_samples,)
+    """
+    if abdomen_sig.ndim == 1:
+        abdomen_sig = abdomen_sig[np.newaxis,:]
+    n_ch, n = abdomen_sig.shape
+    pre_samps = int(pre * fs)
+    post_samps = int(post * fs)
+    out = abdomen_sig.copy().astype(float)
+    tlen = pre_samps + post_samps
+    for p in peaks:
+        a = p - pre_samps
+        b = p + post_samps
+        if a < 0 or b > n:
+            continue
+        # for each channel compute optimal scaling (least squares)
+        for ch in range(n_ch):
+            seg = out[ch, a:b]
+            if seg.size != tlen:
+                continue
+            # scale = (seg * template).sum() / (template*template).sum()
+            denom = np.sum(template*template)
+            if denom == 0:
+                scale = 0.0
+            else:
+                scale = np.sum(seg * template) / denom
+            out[ch, a:b] = seg - scale * template
+    if out.shape[0] == 1:
+        return out[0]
+    return out
+
+# ----------------------------
+# LMS adaptive filter
+# ----------------------------
+def lms_adaptive_filter(primary, reference, mu=0.0005, n_taps=32):
+    """
+    Simple FIR LMS adaptive filter to remove reference from primary.
+    primary: target channel (1D)
+    reference: reference maternal ECG (1D) or multi-channel (m x n)
+    Returns filtered_primary (residual) and final filter weights.
+    """
+    x = np.atleast_2d(reference)
+    if x.shape[0] > x.shape[1]:
+        x = x.T
+    # build reference vector buffer
+    N = len(primary)
+    if x.ndim == 1 or x.shape[0] == 1:
+        ref = np.zeros((n_taps,))
+    # create delayed matrix if single reference
+    if x.ndim == 1 or x.shape[0] == 1:
+        ref_signal = x.flatten()
+        X = np.zeros((N, n_taps))
+        for i in range(n_taps):
+            X[i:, i] = ref_signal[:N - i]
+    else:
+        # if multi reference channels, stack them (simple approach)
+        ref_signal = x.mean(axis=0)
+        X = np.zeros((N, n_taps))
+        for i in range(n_taps):
+            X[i:, i] = ref_signal[:N - i]
+
+    w = np.zeros(n_taps)
+    y = np.zeros(N)
+    e = np.zeros(N)
+    for n in range(N):
+        xn = X[n, :]
+        y[n] = np.dot(w, xn)
+        e[n] = primary[n] - y[n]
+        w = w + 2 * mu * e[n] * xn
+    return e, w
+
+# ----------------------------
+# ICA + wavelet denoising
+# ----------------------------
+def ica_and_wavelet(sig_multi, fs, n_components=None, wavelet='db4', level=3):
+    """
+    sig_multi: channels x samples
+    Returns denoised reconstructed signals (same shape), as well as ICA components.
+    """
+    if sig_multi.ndim == 1:
+        return sig_multi, None, None
+    X = sig_multi.T  # shape (samples, channels)
+    n_chan = X.shape[1]
+    if n_components is None:
+        n_components = min(n_chan, 8)
+    ica = FastICA(n_components=n_components, random_state=0, max_iter=1000)
+    S = ica.fit_transform(X)  # sources (samples, n_components)
+    A = ica.mixing_  # mixing matrix
+    # wavelet denoise each component (soft threshold)
+    S_denoised = np.zeros_like(S)
+    for i in range(S.shape[1]):
+        coeffs = pywt.wavedec(S[:, i], wavelet, level=level)
+        # universal threshold
+        sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+        thr = sigma * np.sqrt(2 * np.log(len(S[:, i])))
+        coeffs_thresh = [pywt.threshold(c, thr, mode='soft') for c in coeffs]
+        S_denoised[:, i] = pywt.waverec(coeffs_thresh, wavelet)[:S.shape[0]]
+    # reconstruct
+    Xrec = np.dot(S_denoised, A.T)
+    sig_rec = Xrec.T  # channels x samples
+    return sig_rec, S_denoised.T, ica
+
+# ----------------------------
+# R-peak detection (fetal)
+# ----------------------------
+def detect_fetal_rpeaks(signal_fecg, fs, min_rr_s=0.25):
+    """
+    Detect fetal R-peaks: uses envelope-based peak detection.
+    Returns indices of detected peaks.
+    """
+    filtered, envelope = env_bandpass_qrs(signal_fecg, fs)
+    # threshold relative to median/percentile
+    thr = np.median(envelope) + 0.35 * (np.percentile(envelope, 95) - np.median(envelope))
+    distance = int(min_rr_s * fs)
+    peaks, props = signal.find_peaks(envelope, height=thr, distance=distance)
+    # refine peaks by searching local maxima in filtered signal around envelope peaks
+    refined = []
+    win = int(0.04 * fs)
+    for p in peaks:
+        a = max(0, p - win)
+        b = min(len(filtered), p + win)
+        if a >= b:
+            continue
+        local_max = a + np.argmax(np.abs(filtered[a:b]))
+        refined.append(local_max)
+    return np.array(sorted(set(refined)))
+
+def compute_fhr_from_peaks(peaks, fs, window_s=6.0, step_s=3.0):
+    """
+    Compute FHR time series per PhysioNet Challenge: IPFM-like method.
+    Returns times (center of windows) and HR in bpm.
+    """
+    if len(peaks) < 2:
+        return np.array([]), np.array([])
+    samples = peaks
+    N = int(window_s * fs)
+    step = int(step_s * fs)
+    duration = samples[-1]
+    times = []
+    hr = []
+    # windows centered such that first and last omitted per challenge rules (we'll just compute sliding windows)
+    start = 0
+    end = int(duration)
+    for wstart in range(start, end - N + 1, step):
+        wend = wstart + N
+        count = np.sum((samples >= wstart) & (samples < wend))
+        times.append((wstart + wend) / 2.0 / fs)
+        hr_val = (count / window_s) * 60.0  # bpm
+        hr.append(hr_val)
+    return np.array(times), np.array(hr)
+
+# ----------------------------
+# Evaluation vs annotations
+# ----------------------------
+def load_reference_ann(ann_path):
+    """
+    Loads wfdb annotation file (.fqrs or .ann) or WFDB-style annotation via wfdb.rdann
+    ann_path: base path without extension or full .fqrs file path
+    Returns sample indices of reference fetal R-peaks.
+    """
+    base, ext = os.path.splitext(ann_path)
+    if ext == '':
+        ann = wfdb.rdann(ann_path, extension='fqrs')
+    else:
+        # remove ext and call rdann
+        ann = wfdb.rdann(base, extension=ext.lstrip('.'))
+    return np.array(ann.sample)
+
+def evaluate_beats(ref_peaks, test_peaks, tolerance_ms=50, fs=1000):
+    """
+    Simple beat-level sensitivity/PPV style evaluation:
+    For each reference peak, check if there is a test peak within +/- tolerance_ms.
+    Returns TP, FN, FP, sensitivity, PPV.
+    """
+    tol = int((tolerance_ms / 1000.0) * fs)
+    ref = np.array(ref_peaks)
+    test = np.array(test_peaks)
+    TP = 0
+    matched_test_idx = set()
+    for r in ref:
+        candidates = np.where(np.abs(test - r) <= tol)[0]
+        if candidates.size > 0:
+            TP += 1
+            matched_test_idx.add(candidates[0])
+    FN = len(ref) - TP
+    FP = len(test) - len(matched_test_idx)
+    sens = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    ppv = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    return {'TP': TP, 'FN': FN, 'FP': FP, 'sensitivity': sens, 'PPV': ppv}
+
+# ----------------------------
+# Plotting utilities
+# ----------------------------
+def plot_signals(t, raw, filtered, peaks=None, title=''):
+    plt.figure(figsize=(12,4))
+    plt.plot(t, raw, label='raw abdominal (one channel)', alpha=0.5)
+    plt.plot(t, filtered, label='filtered fECG', linewidth=1)
+    if peaks is not None and peaks.size>0:
+        plt.plot(peaks/len(t)*t[-1], filtered[peaks], 'r.', label='detected R-peaks')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (uV or mV)')
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def plot_fhr(times, hr):
+    plt.figure(figsize=(10,3))
+    plt.plot(times, hr, '-o')
+    plt.xlabel('Time (s)')
+    plt.ylabel('FHR (bpm)')
+    plt.title('Fetal heart rate tracing')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# ----------------------------
+# Main pipeline
+# ----------------------------
+def pipeline(record_path, ann_path=None, chest_ch=None, abdomen_chs=None, do_plot=True):
+    """
+    record_path: path to wfdb record base (no extension) or CSV
+    ann_path: optional path to annotation base (without extension) or file
+    chest_ch: index or name of chest/maternal reference channel (if available)
+    abdomen_chs: list of indices or names for abdominal channels to use (default first 4)
+    """
+    sig, fs, ch_names = load_record(record_path, channels=None)
+    print(f"Loaded record with {sig.shape[0]} channels, fs={fs} Hz, channel names={ch_names}")
+    # choose abdomen channels
+    if abdomen_chs is None:
+        # default: first 4 abdominal channels if available; else take all
+        if sig.shape[0] >= 4:
+            abd_idx = list(range(4))
+        else:
+            abd_idx = list(range(sig.shape[0]))
+    else:
+        # translate names to indices if needed
+        abd_idx = []
+        for c in abdomen_chs:
+            if isinstance(c, str):
+                abd_idx.append(ch_names.index(c))
+            else:
+                abd_idx.append(int(c))
+    abdomen = sig[abd_idx, :]
+    # choose chest channel for maternal reference (if provided)
+    chest_ref = None
+    if chest_ch is not None:
+        if isinstance(chest_ch, str):
+            chest_idx = ch_names.index(chest_ch)
+        else:
+            chest_idx = chest_ch
+        chest_ref = sig[chest_idx, :]
+
+    # 1. Preprocessing: HP + notch + optional bandpass
+    hp_b, hp_a = butter_highpass(0.5, fs, order=3)
+    abdomen_hp = signal.filtfilt(hp_b, hp_a, abdomen, axis=1)
+    if chest_ref is not None:
+        chest_hp = signal.filtfilt(hp_b, hp_a, chest_ref)
+    else:
+        chest_hp = None
+
+    # notch mains (try 50 and 60 Hz)
+    try:
+        abdomen_notched = np.zeros_like(abdomen_hp)
+        for i in range(abdomen_hp.shape[0]):
+            abdomen_notched[i,:] = notch_filter(abdomen_hp[i,:], fs, f0=50.0, Q=30.0)
+    except Exception:
+        abdomen_notched = abdomen_hp
+
+    # (optional) bandpass keep QRS
+    b, a = butter_bandpass(1.0, 100.0, fs, order=3)
+    abdomen_bp = signal.filtfilt(b, a, abdomen_notched, axis=1)
+
+    # 2. Maternal R-peak detection (from chest, or largest abdominal channel)
+    if chest_hp is not None:
+        m_peaks = detect_maternal_rpeaks(chest_hp, fs)
+        maternal_ref_src = chest_hp
+    else:
+        # use the channel with largest amplitude as maternal reference
+        ch_idx = np.argmax(np.std(abdomen_bp, axis=1))
+        maternal_ref_src = abdomen_bp[ch_idx,:]
+        m_peaks = detect_maternal_rpeaks(maternal_ref_src, fs)
+    print(f"Detected {len(m_peaks)} maternal peaks")
+
+    # 3. Maternal template subtraction
+    template = build_maternal_template(maternal_ref_src, m_peaks, fs)
+    if template is not None:
+        abdomen_after_template = subtract_template_from_abdomen(abdomen_bp, template, m_peaks, fs)
+    else:
+        abdomen_after_template = abdomen_bp.copy()
+
+    # 4. Adaptive LMS cancellation (optional) - apply channel-wise
+    # Use maternal_ref_src as reference
+    try:
+        abd_lms = np.zeros_like(abdomen_after_template)
+        for ch in range(abdomen_after_template.shape[0]):
+            e, w = lms_adaptive_filter(abdomen_after_template[ch,:], maternal_ref_src, mu=0.0006, n_taps=32)
+            abd_lms[ch,:] = e
+    except Exception:
+        abd_lms = abdomen_after_template
+
+    # 5. ICA + wavelet denoising
+    rec, comps, ica_model = ica_and_wavelet(abd_lms, fs, n_components=min(6, abd_lms.shape[0]), wavelet='db4', level=3)
+
+    # Heuristic: choose the component with maximum energy in QRS band as fetal candidate
+    candidate_chan = None
+    energies = []
+    for i in range(rec.shape[0]):
+        f_sig = rec[i,:]
+        # bandpass 5-100 Hz energy
+        bq, aq = butter_bandpass(5, 100, fs, order=3)
+        fq = signal.filtfilt(bq, aq, f_sig)
+        energies.append(np.sum(np.abs(fq)))
+    energies = np.array(energies)
+    candidate_idx = np.argmin(energies) if energies.size else 0  # fetal is lower amplitude; heuristic
+    fetal_candidate = rec[candidate_idx, :]
+
+    # 6. Wavelet denoise on fetal candidate (extra)
+    coeffs = pywt.wavedec(fetal_candidate, 'db4', level=4)
+    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+    thr = sigma * np.sqrt(2 * np.log(len(fetal_candidate)))
+    coeffs_thresh = [pywt.threshold(c, thr, mode='soft') for c in coeffs]
+    fetal_clean = pywt.waverec(coeffs_thresh, 'db4')[:fetal_candidate.size]
+
+    # 7. Fetal R-peak detection
+    peaks_fetal = detect_fetal_rpeaks(fetal_clean, fs, min_rr_s=0.25)
+    print(f"Detected {len(peaks_fetal)} fetal peaks (raw)")
+
+    # 8. Compute FHR time series
+    fhr_times, fhr_vals = compute_fhr_from_peaks(peaks_fetal, fs, window_s=6.0, step_s=3.0)
+
+    # 9. Optional evaluation vs ref annotations
+    eval_metrics = None
+    if ann_path is not None:
+        try:
+            ref_peaks = load_reference_ann(ann_path)
+            eval_metrics = evaluate_beats(ref_peaks, peaks_fetal, tolerance_ms=50, fs=fs)
+            print("Evaluation:", eval_metrics)
+        except Exception as e:
+            print("Warning: could not load/compare annotations:", e)
+
+    # 10. Plots
+    if do_plot:
+        t = np.arange(fetal_clean.size) / fs
+        # plot raw abdomen channel used (first abdominal channel) and fetal clean
+        raw_plot = abdomen_bp[0,:]
+        plot_signals(t, raw_plot, fetal_clean, peaks=peaks_fetal, title=os.path.basename(record_path))
+        plot_fhr(fhr_times, fhr_vals)
+
+    return {
+        'fetal_signal': fetal_clean,
+        'fetal_peaks': peaks_fetal,
+        'fhr_times': fhr_times,
+        'fhr_vals': fhr_vals,
+        'eval': eval_metrics
+    }
+
+# ----------------------------
+# Command-line interface
+# ----------------------------
+if __name__ == '__main__':
+    p = argparse.ArgumentParser(description="Noninvasive fetal ECG extraction example")
+    p.add_argument('--record', required=True, help="Path to record (wfdb base name or CSV). For wfdb, give base without extension.")
+    p.add_argument('--ann', default=None, help="Path to annotation (wfdb base name) or .fqrs file (optional)")
+    p.add_argument('--chest', default=None, help="Chest channel index or name (optional)")
+    p.add_argument('--abd', default=None, nargs='+', help="Abdominal channel indices or names (optional)")
+    p.add_argument('--no-plot', action='store_true', help="Disable plotting")
+    args = p.parse_args()
+
+    chest = None
+    if args.chest is not None:
+        try:
+            chest = int(args.chest)
+        except Exception:
+            chest = args.chest
+    abds = None
+    if args.abd is not None:
+        tmp = []
+        for v in args.abd:
+            try:
+                tmp.append(int(v))
+            except Exception:
+                tmp.append(v)
+        abds = tmp
+
+    results = pipeline(args.record, ann_path=args.ann, chest_ch=chest, abdomen_chs=abds, do_plot=(not args.no_plot))
+    print("Done.")
