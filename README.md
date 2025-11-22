@@ -1,21 +1,10 @@
-# EGC Demo — Streamlit Cloud Deployment
+# Fetal ECG Extraction (Streamlit)
 
-This repository contains the FECG Demo Edition Streamlit app.
+This is a Streamlit app for noninvasive fetal ECG extraction using PhysioNet Challenge 2013 data.
 
-## 🚀 Deploy on Streamlit Cloud
+## How to Run
 
-1. Create a new GitHub repository
-2. Upload all files in this folder
-3. Go to https://share.streamlit.io
-4. Click **New App**
-5. Select your repo
-6. Set **Main file** to `app.py`
-7. Deploy!
-
-Your app will be live at:
-
-```
-https://<your-app-name>.streamlit.app
-```
-
-Enjoy!
+1. Clone this repo:
+   ```bash
+   git clone https://github.com/cygnixx/ecg-extraction.git
+   cd ecg-extraction
