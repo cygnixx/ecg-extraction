@@ -1,27 +1,24 @@
-# Noninvasive fECG extraction 
+# AirLyze Demo — Streamlit Cloud Deployment
 
-This repo contains a Python script implementing an end-to-end pipeline for
-noninvasive fetal ECG extraction from multichannel maternal abdominal recordings
-(PhysioNet Challenge 2013 dataset).
+This repository contains the AirLyze Demo Edition Streamlit app.
 
-See: PhysioNet/Computing in Cardiology Challenge 2013. :contentReference[oaicite:1]{index=1}
+## 🚀 Deploy on Streamlit Cloud
 
-Files:
-- fetal_ecg_extraction.py  : main script (usage examples inside)
-- requirements.txt         : Python dependencies
+1. Create a new GitHub repository
+2. Upload all files in this folder:
+   - `AirLyze_Demo.py`
+   - `requirements.txt`
+   - `README.md`
+3. Go to https://share.streamlit.io
+4. Click **New App**
+5. Select your repo
+6. Set **Main file** to `AirLyze_Demo.py`
+7. Deploy!
 
-Quick start:
-1. Create virtualenv and `pip install -r requirements.txt`.
-2. Download PhysioNet challenge dataset (set-a or set-b) from PhysioNet (zip or tar) and extract.
-3. Run:
-   `python fetal_ecg_extraction.py --record path/to/recordname --ann path/to/recordname.fqrs`
-   - If you don't have annotation file, omit `--ann` (evaluation will be skipped).
+Your app will be live at:
 
-The script demonstrates:
-- Preprocessing (HP, notch, optional bandpass)
-- Maternal cancellation (template subtraction, LMS adaptive filter)
-- ICA-based separation + wavelet denoising
-- QRS detection (simple filtered-peaks approach)
-- Plots and optional evaluation vs. reference annotations
+```
+https://<your-app-name>.streamlit.app
+```
 
-License: MIT
+Enjoy!

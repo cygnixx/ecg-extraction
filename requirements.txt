@@ -1,9 +1,4 @@
 streamlit
-numpy
 pandas
-matplotlib
-scipy
-scikit-learn
-wfdb
-pywt
-requests
+numpy
+plotly
